@@ -44,11 +44,11 @@ static Graph* Matmul(int m, int k, int n, bool transpose_a, bool transpose_b,
   }                                                                          \
   BENCHMARK(                                                                 \
       BM_oneDNNMatmul##_##M##_##K##_##N##_##TA##_##TB##_##TFTYPE##_##DEVICE) \
-      ->MeasureProcessCPUTime();
+      ->MeasureProcessCPUTime()->Iterations(50)->UseRealTime();
 
 #define BM_Matmul(M, K, N, TA, TB)                           \
   BM_oneDNNMatmulDev(M, K, N, TA, TB, float, DT_FLOAT, cpu); \
-  BM_oneDNNMatmulDev(M, K, N, TA, TB, bfloat16, DT_BFLOAT16, cpu);
+  // BM_oneDNNMatmulDev(M, K, N, TA, TB, bfloat16, DT_BFLOAT16, cpu);
 
 // Benchmarking the same matmul shapes as `matmul_op_test.cc`
 // LINT.IfChange

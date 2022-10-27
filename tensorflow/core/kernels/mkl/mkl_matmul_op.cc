@@ -1,11 +1,8 @@
 /* Copyright 2017 The TensorFlow Authors. All Rights Reserved.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-
     http://www.apache.org/licenses/LICENSE-2.0
-
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -23,7 +20,7 @@ limitations under the License.
 // and when it is undefined at build time, this file becomes an empty
 // compilation unit
 
-#if defined(INTEL_MKL)
+#ifdef INTEL_MKL
 
 #include "dnnl.hpp"
 #include "tensorflow/core/framework/op.h"
@@ -32,72 +29,182 @@ limitations under the License.
 #include "tensorflow/core/kernels/fill_functor.h"
 #include "tensorflow/core/kernels/mkl/mkl_matmul_ops_common.h"
 #include "tensorflow/core/util/mkl_util.h"
+#include "tensorflow/core/lib/core/errors.h"
 
 namespace tensorflow {
 
 typedef Eigen::ThreadPoolDevice CPUDevice;
 
-template <typename Device, typename T, bool USE_CUBLAS>
-class MklMatMulOp : public OpKernel {
+template <typename Device, typename T, bool native_format = false>
+class MklMatMulOp : public MklDnnMatMulOpBase<T, T> {
  public:
-  explicit MklMatMulOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
+  explicit MklMatMulOp(OpKernelConstruction* ctx) 
+      : MklDnnMatMulOpBase<T, T>(ctx) {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("transpose_a", &transpose_a_));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("transpose_b", &transpose_b_));
+    if (AreWeightsFrozen()) {
+      this->is_weight_const_ = true;
+    }
   }
 
   void Compute(OpKernelContext* ctx) override {
-    const Tensor& a = ctx->input(0);
-    const Tensor& b = ctx->input(1);
+    const Tensor& src_tensor = ctx->input(this->kInputIndexSrc);
+    const Tensor& weight_tensor = ctx->input(this->kInputIndexWeight);
+    // const Tensor& bias_tensor = ctx->input(this->kInputIndexBias);
 
-    // Check that the dimensions of the two matrices are valid.
-    OP_REQUIRES(ctx, TensorShapeUtils::IsMatrix(a.shape()),
-                errors::InvalidArgument("In[0] ndims must be >= 2"));
-    OP_REQUIRES(ctx, TensorShapeUtils::IsMatrix(b.shape()),
-                errors::InvalidArgument("In[1] ndims must be >= 2"));
+
+    // MklDnnShape src_mkl_shape;
+    // MklDnnShape weight_mkl_shape;
+    // std::cout << "CHECKPOINT 1" << std::endl;
+    // GetMklShape(ctx, this->kInputIndexSrc, &src_mkl_shape, native_format);
+    // GetMklShape(ctx, this->kInputIndexWeight, &weight_mkl_shape, native_format);
+    // OP_REQUIRES(ctx, !weight_mkl_shape.IsMklTensor(),
+    //             errors::InvalidArgument("Weight should not be in MKL Layout."));
+
+
+    // Get shapes of input tensors
+    auto src_tf_shape = src_tensor.shape();
+    auto weight_tf_shape = weight_tensor.shape();
+
     Eigen::array<Eigen::IndexPair<Eigen::DenseIndex>, 1> dim_pair;
+    // const int dim_pair[] = {1, transpose_b_ ? 1: 0};
+    // const int channel = weight_tf_shape.dim_size(1 - dim_pair[1]);
     dim_pair[0].first = transpose_a_ ? 0 : 1;
     dim_pair[0].second = transpose_b_ ? 1 : 0;
 
-    int d1 = a.dim_size(dim_pair[0].first);
-    int d2 = b.dim_size(dim_pair[0].second);
-    OP_REQUIRES(ctx, d1 == d2,
-                errors::InvalidArgument("Matrix size-incompatible: In[0]: ",
-                                        a.shape().DebugString(),
-                                        ", In[1]: ", b.shape().DebugString()));
-    int a_dim_remaining = 1 - dim_pair[0].first;
-    int b_dim_remaining = 1 - dim_pair[0].second;
-    TensorShape out_shape(
-        {a.dim_size(a_dim_remaining), b.dim_size(b_dim_remaining)});
-    Tensor* out = nullptr;
-    OP_REQUIRES_OK(ctx, ctx->allocate_output(0, out_shape, &out));
+    const int channel = weight_tf_shape.dim_size(1 - dim_pair[0].second);
 
-    if (out->NumElements() == 0) {
-      // If a has shape [0, x] or b has shape [x, 0], the output shape
-      // is a 0-element matrix, so there is nothing to do.
+    Tensor bias_tensor(DT_FLOAT, TensorShape({channel}));
+    auto bias_flat = bias_tensor.flat<float>();
+    for (int i = 0; i < bias_tensor.NumElements(); i++) {
+      bias_flat(i) = 0;
+    }
+
+    // Check the constraint of input matrix and bias
+    OP_REQUIRES(ctx, TensorShapeUtils::IsMatrix(src_tf_shape),
+                errors::InvalidArgument("In[0] is not a matrix"));
+    OP_REQUIRES(ctx, TensorShapeUtils::IsMatrix(weight_tf_shape),
+                errors::InvalidArgument("In[1] is not a matrix"));
+    for (int i = 0; i < bias_tensor.dims() - 1; i++){
+      OP_REQUIRES(
+        ctx, bias_tensor.dim_size(i) == 1,
+        errors::InvalidArgument("For bias_dims > 1, all except the "
+                                "last dimension (channel) must be 1, got: ",
+                                bias_tensor.shape().DebugString()));
+    }
+
+    const int batch = src_tf_shape.dim_size(1 - dim_pair[0].first);
+    const int k = src_tf_shape.dim_size(dim_pair[0].first);
+
+    OP_REQUIRES(
+        ctx, k == weight_tf_shape.dim_size(dim_pair[0].second),
+        errors::InvalidArgument(
+            "Matrix size-incompatible: In[0]: ", src_tf_shape.DebugString(),
+            ", In[1]: ", weight_tf_shape.DebugString()));
+    OP_REQUIRES(ctx, bias_tensor.dim_size(bias_tensor.dims() - 1) == channel,
+                errors::InvalidArgument(
+                    "Must provide as many biases as the channel size: ",
+                    bias_tensor.shape().DebugString(), " vs. ", channel));
+
+    memory::dims src_dims = memory::dims({batch, k});
+    memory::dims weight_dims = memory::dims({channel, k});
+    memory::dims bias_dims = memory::dims({channel});
+    memory::dims dst_dims = memory::dims({batch, channel});
+    memory::format_tag src_format = memory::format_tag::nc;
+    memory::format_tag weight_format =
+        transpose_b_ ? memory::format_tag::oi : memory::format_tag::io;
+
+    MklDnnMatMulFwdParams matmul_params(
+      src_dims, weight_dims, bias_dims, dst_dims, src_format,
+      (this->is_weight_const_) ? memory::format_tag::any : weight_format,
+      memory::format_tag::nc, this->is_weight_const_);
+    // ExtendMklDnnMatMulFwdParams(ctx, matmul_params);
+
+    MklDnnMatMulFwdPrimitive<T, T, T, T, T>* matmul_prim =
+      MklDnnMatMulFwdPrimitiveFactory<T, T, T, T, T>::Get(matmul_params, 0);
+
+    // Allocate output tensor.
+    Tensor* dst_tensor = nullptr;
+    std::shared_ptr<dnnl::inner_product_forward::primitive_desc> matmul_pd =
+      matmul_prim->GetPrimitiveDesc();
+    
+    // MklDnnShape output_mkl_shape;
+    // output_mkl_shape.SetMklTensor(false);
+
+    TensorShape output_tf_shape({batch, channel});
+    // std::cout << "CHECKPOINT 2" << std::endl;
+    // AllocateOutputSetMklShape(ctx, 0, &dst_tensor, output_tf_shape,
+    //                           output_mkl_shape, native_format);
+    OP_REQUIRES_OK(ctx, ctx->allocate_output(0, output_tf_shape, &dst_tensor));
+
+    // std::cout << "CHECKPOINT 3" << std::endl;
+
+    if (batch == 0 || channel == 0) {
       return;
     }
 
-    if (a.NumElements() == 0 && b.NumElements() == 0) {
-      // If a has shape [x, 0] and b has shape [0, y], the
-      // output shape is [x, y] where x and y are non-zero, so we fill
-      // the output with zeros.
-      functor::SetZeroFunctor<Device, T> f;
-      f(ctx->eigen_device<Device>(), out->flat<T>());
-      return;
-    }
+    try {
+      T* src_data = const_cast<T*>(src_tensor.flat<T>().data());
+      T* weight_data = const_cast<T*>(weight_tensor.flat<T>().data());
+      T* bias_data = const_cast<T*>(bias_tensor.flat<T>().data());
+      T* dst_data = const_cast<T*>(dst_tensor->flat<T>().data());
 
-    const int m = a.dim_size(1 - dim_pair[0].first);
-    const int k = a.dim_size(dim_pair[0].first);
-    const int n = b.dim_size(1 - dim_pair[0].second);
-    bool transpose_a = dim_pair[0].first == 0;
-    bool transpose_b = dim_pair[0].second == 1;
+      // MklDnnData<T> src_mkl(&(this->cpu_engine_));
+      // MklDnnData<T> weight_mkl(&(this->cpu_engine_));
 
-    auto a_ptr = (a.template flat<T>().data());
-    auto b_ptr = (b.template flat<T>().data());
-    auto c_ptr = (out->template flat<T>().data());
+      auto src_md = memory::desc(src_dims, MklDnnType<T>(), src_format);
+      auto weight_md = memory::desc(weight_dims, MklDnnType<T>(), weight_format);
+      
+      // if (src_md != matmul_pd->src_desc()) {
+      //   src_mkl.SetUsrMem(src_md, src_data);
+      //   src_mkl.CheckReorderToOpMem(matmul_pd.get()->src_desc(),
+      //                               this->cpu_engine_, ctx);
+      //   src_data = reinterpret_cast<T*>(src_mkl.GetOpMem().get_data_handle());
+      // }
 
-    MklBlasGemm(ctx, transpose_a, transpose_b, m, n, k, a_ptr,
-                transpose_a ? m : k, b_ptr, transpose_b ? k : n, c_ptr, n);
+      // Get cached data when weight is const.
+      // const memory::desc weight_md = 
+      //   memory::desc(weight_dims, MklDnnType<T>(), weight_format);
+      // if (weight_md != matmul_pd->weights_desc()) {
+      //   T* cached_weight_data = nullptr;
+
+      //   if (this->is_weight_const_) {
+      //     if (this->IsWeightCacheEmpty(ctx)) {
+      //       this->CacheWeight(ctx, matmul_pd, cached_weight_data,
+      //       weight_tensor, weight_mkl, weight_md);
+      //     }
+      //     cached_weight_data =
+      //       this->GetCachedWeight(ctx, matmul_pd->weights_desc());
+      //   }
+
+      //   if (cached_weight_data != nullptr) {
+      //     weight_data = cached_weight_data;
+      //   } else {
+      //     weight_mkl.SetUsrMem(weight_md, weight_data);
+      //     weight_mkl.CheckReorderToOpMem(matmul_pd.get()->weights_desc(),
+      //                                    this->cpu_engine_, ctx);
+      //     weight_data =
+      //       reinterpret_cast<T*>(weight_mkl.GetOpMem().get_data_handle());
+      //   }
+      // }
+      std::shared_ptr<stream> cpu_stream;
+      auto st = ExecuteSingleThreadedGemm(batch, channel, k, sizeof(T));
+      MklDnnThreadPool eigen_tp(ctx, st ? 1 : -1);
+      cpu_stream.reset(CreateStream(&eigen_tp, matmul_prim->GetEngine()));
+
+      UserScratchPad<unsigned char> scratch_pad;
+      scratch_pad.AllocateSPTensor(matmul_prim, ctx);
+
+      // Execute matmul op
+      matmul_prim->Execute(src_data, weight_data, bias_data, dst_data,
+                           scratch_pad.Get(), cpu_stream);
+    } catch(dnnl::error& e) {
+      string error_msg = "Status: " + std::to_string(e.status) +
+                         ", message: " + string(e.message) + ", in file " +
+                         string(__FILE__) + ":" + std::to_string(__LINE__);
+      OP_REQUIRES_OK(
+          ctx, errors::Aborted("Operation received an exception:", error_msg));
+    }       
   }
 
  private:
@@ -143,52 +250,6 @@ class MklMatMulOp : public OpKernel {
   // layout, leading dimension is the stride between consecutive rows, max(1,n)
   //
   // --------------------------------------------------------------------------
-  void MklBlasGemm(OpKernelContext* ctx, bool transa, bool transb, const int m,
-                   const int n, const int k, const float* a, const int lda,
-                   const float* b, const int ldb, float* c, const int ldc) {
-    // BLAS GEMM API defines Matrix Multiplication as c = alpha * op(a) * op(b)
-    // + beta * c.
-    // Since TF MatMul does not have parameters for alpha, beta, we set them to
-    // 1.0 and 0.0 respectively.
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    char char_transa = transa ? 'T' : 'N';
-    char char_transb = transb ? 'T' : 'N';
-    VLOG(2) << "MKL DNN SGEMM called";
-#ifndef ENABLE_ONEDNN_OPENMP
-    MklDnnThreadPool eigen_tp(ctx);
-    // With threadpool , the runtime overhead is comparable to the kernel
-    // execution for small kernel sizes. For such sizes, it may be better to run
-    // the kernel single threaded. Here we are coming up with a cost model based
-    // on L1 sizes. If we find that matrices are small enough, we will execute
-    // single threaded. This may need tuning.
-    if (ExecuteSingleThreadedGemm(m, n, k, sizeof(float))) {
-      // For now, call single-threaded gemm.
-      dnnl::threadpool_interop::sgemm(char_transa, char_transb, m, n, k, alpha,
-                                      a, lda, b, ldb, beta, c, ldc, nullptr);
-    } else {
-      dnnl::threadpool_interop::sgemm(char_transa, char_transb, m, n, k, alpha,
-                                      a, lda, b, ldb, beta, c, ldc, &eigen_tp);
-    }
-#else
-    dnnl_sgemm(char_transa, char_transb, m, n, k, alpha, a, lda, b, ldb, beta,
-               c, ldc);
-#endif  // !ENABLE_ONEDNN_OPENMP
-  }
-
-  void MklBlasGemm(OpKernelContext* ctx, bool transa, bool transb, const int m,
-                   const int n, const int k, const bfloat16* a, const int lda,
-                   const bfloat16* b, const int ldb, bfloat16* c,
-                   const int ldc) {
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    const int index_transa = transa ? 1 : 0;
-    const int index_transb = transb ? 1 : 0;
-
-    const char ftrans[] = {'N', 'T', 'C'};
-    dnnl_gemm<bfloat16>(ftrans[index_transa], ftrans[index_transb], m, n, k,
-                        alpha, a, lda, b, ldb, beta, c, ldc, ctx);
-  }
 };
 
 #define REGISTER_CPU(T)                                   \
