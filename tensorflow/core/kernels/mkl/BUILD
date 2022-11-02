@@ -139,6 +139,23 @@ tf_cc_test_mkl(
     ] + MKL_TEST_DEPS,
 )
 
+tf_cc_test_mkl(
+    name = "mkl_matmul_op_test",
+    size = "small",
+    srcs = ["mkl_matmul_op_test.cc"],
+    linkstatic = 1, # Fixes dyld error on MacOS.
+    deps = [
+        ":mkl_matmul_op",
+        "//tensorflow/core:array_ops_op_lib",
+        "//tensorflow/core:math_ops_op_lib",
+        "//tensorflow/core:nn_ops_op_lib",
+        "//tensorflow/core/framework:fake_input",
+        "//tensorflow/core/framework:tensor_testutil",
+        "//tensorflow/core/kernels:matmul_op",
+        "//tensorflow/core:direct_session",
+    ] + MKL_TEST_DEPS
+)
+
 tf_mkl_kernel_library(
     name = "mkl_quantize_op",
     srcs = ["mkl_quantize_op.cc"],
