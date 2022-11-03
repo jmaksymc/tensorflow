@@ -50,25 +50,12 @@ class MklMatMulOp : public MklDnnMatMulOpBase<T, T> {
   void Compute(OpKernelContext* ctx) override {
     const Tensor& src_tensor = ctx->input(this->kInputIndexSrc);
     const Tensor& weight_tensor = ctx->input(this->kInputIndexWeight);
-    // const Tensor& bias_tensor = ctx->input(this->kInputIndexBias);
-
-
-    // MklDnnShape src_mkl_shape;
-    // MklDnnShape weight_mkl_shape;
-    // std::cout << "CHECKPOINT 1" << std::endl;
-    // GetMklShape(ctx, this->kInputIndexSrc, &src_mkl_shape, native_format);
-    // GetMklShape(ctx, this->kInputIndexWeight, &weight_mkl_shape, native_format);
-    // OP_REQUIRES(ctx, !weight_mkl_shape.IsMklTensor(),
-    //             errors::InvalidArgument("Weight should not be in MKL Layout."));
-
 
     // Get shapes of input tensors
     auto src_tf_shape = src_tensor.shape();
     auto weight_tf_shape = weight_tensor.shape();
 
     Eigen::array<Eigen::IndexPair<Eigen::DenseIndex>, 1> dim_pair;
-    // const int dim_pair[] = {1, transpose_b_ ? 1: 0};
-    // const int channel = weight_tf_shape.dim_size(1 - dim_pair[1]);
     dim_pair[0].first = transpose_a_ ? 0 : 1;
     dim_pair[0].second = transpose_b_ ? 1 : 0;
 
@@ -118,7 +105,6 @@ class MklMatMulOp : public MklDnnMatMulOpBase<T, T> {
       src_dims, weight_dims, bias_dims, dst_dims, src_format,
       (this->is_weight_const_) ? memory::format_tag::any : weight_format,
       memory::format_tag::nc, this->is_weight_const_);
-    // ExtendMklDnnMatMulFwdParams(ctx, matmul_params);
 
     MklDnnMatMulFwdPrimitive<T, T, T, T, T>* matmul_prim =
       MklDnnMatMulFwdPrimitiveFactory<T, T, T, T, T>::Get(matmul_params, 0);
@@ -127,17 +113,9 @@ class MklMatMulOp : public MklDnnMatMulOpBase<T, T> {
     Tensor* dst_tensor = nullptr;
     std::shared_ptr<dnnl::inner_product_forward::primitive_desc> matmul_pd =
       matmul_prim->GetPrimitiveDesc();
-    
-    // MklDnnShape output_mkl_shape;
-    // output_mkl_shape.SetMklTensor(false);
 
     TensorShape output_tf_shape({batch, channel});
-    // std::cout << "CHECKPOINT 2" << std::endl;
-    // AllocateOutputSetMklShape(ctx, 0, &dst_tensor, output_tf_shape,
-    //                           output_mkl_shape, native_format);
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, output_tf_shape, &dst_tensor));
-
-    // std::cout << "CHECKPOINT 3" << std::endl;
 
     if (batch == 0 || channel == 0) {
       return;
@@ -149,44 +127,9 @@ class MklMatMulOp : public MklDnnMatMulOpBase<T, T> {
       T* bias_data = const_cast<T*>(bias_tensor.flat<T>().data());
       T* dst_data = const_cast<T*>(dst_tensor->flat<T>().data());
 
-      // MklDnnData<T> src_mkl(&(this->cpu_engine_));
-      // MklDnnData<T> weight_mkl(&(this->cpu_engine_));
-
       auto src_md = memory::desc(src_dims, MklDnnType<T>(), src_format);
       auto weight_md = memory::desc(weight_dims, MklDnnType<T>(), weight_format);
-      
-      // if (src_md != matmul_pd->src_desc()) {
-      //   src_mkl.SetUsrMem(src_md, src_data);
-      //   src_mkl.CheckReorderToOpMem(matmul_pd.get()->src_desc(),
-      //                               this->cpu_engine_, ctx);
-      //   src_data = reinterpret_cast<T*>(src_mkl.GetOpMem().get_data_handle());
-      // }
 
-      // Get cached data when weight is const.
-      // const memory::desc weight_md = 
-      //   memory::desc(weight_dims, MklDnnType<T>(), weight_format);
-      // if (weight_md != matmul_pd->weights_desc()) {
-      //   T* cached_weight_data = nullptr;
-
-      //   if (this->is_weight_const_) {
-      //     if (this->IsWeightCacheEmpty(ctx)) {
-      //       this->CacheWeight(ctx, matmul_pd, cached_weight_data,
-      //       weight_tensor, weight_mkl, weight_md);
-      //     }
-      //     cached_weight_data =
-      //       this->GetCachedWeight(ctx, matmul_pd->weights_desc());
-      //   }
-
-      //   if (cached_weight_data != nullptr) {
-      //     weight_data = cached_weight_data;
-      //   } else {
-      //     weight_mkl.SetUsrMem(weight_md, weight_data);
-      //     weight_mkl.CheckReorderToOpMem(matmul_pd.get()->weights_desc(),
-      //                                    this->cpu_engine_, ctx);
-      //     weight_data =
-      //       reinterpret_cast<T*>(weight_mkl.GetOpMem().get_data_handle());
-      //   }
-      // }
       std::shared_ptr<stream> cpu_stream;
       auto st = ExecuteSingleThreadedGemm(batch, channel, k, sizeof(T));
       MklDnnThreadPool eigen_tp(ctx, st ? 1 : -1);
